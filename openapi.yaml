@@ -1,0 +1,1788 @@
+openapi: 3.0.3
+info:
+  title: Wallet Gateway — User Management API
+  version: 1.0.0
+  description: |
+    Multi-tenant user management, authentication and authorization for the
+    Wallet Gateway platform.
+
+    ## Authentication
+    * **Users** sign in with email/password and receive a short-lived JWT access
+      token plus a rotating refresh token. Browsers send `X-Auth-Mode: cookie`
+      and get the refresh token in a HttpOnly, SameSite=Strict cookie instead of
+      the response body.
+    * **API clients** use the OAuth 2.0 client-credentials grant at
+      `/api/v1/oauth/token`. Their tokens carry `principal_type=api_client`.
+
+    Access tokens deliberately carry no permission claims: authorization is
+    resolved per request from OpenFGA relationships, OPA policy and the
+    permission catalog.
+
+    ## Authorization
+    Permissions are `service.resource.action[.field]` with a scope
+    (`own`…`all`), an effect (`allow`/`deny`, deny wins) and optional
+    conditions. Responses omit fields the caller cannot read; requests carrying
+    a field the caller cannot write are rejected with `FIELD_NOT_ALLOWED`.
+
+    ## Delegation
+    A principal may only grant permissions it holds itself, at an equal or
+    narrower scope. Violations return `PERMISSION_DELEGATION_DENIED`.
+  license:
+    name: Proprietary
+servers:
+  - url: http://localhost:8090
+    description: Local development
+tags:
+  - name: Authentication
+  - name: OAuth
+  - name: Tenants
+  - name: Users
+  - name: Roles
+  - name: Permissions
+  - name: API Clients
+  - name: Audit Logs
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [Authentication]
+      summary: Liveness probe
+      security: []
+      responses:
+        '200':
+          description: The service is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [Authentication]
+      summary: Readiness probe (checks database, Redis, OPA, OpenFGA)
+      security: []
+      responses:
+        '200':
+          description: All dependencies are usable.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: string }
+              example:
+                database: ok
+                redis: ok
+                opa: ok
+                openfga: ok
+        '503':
+          description: A required dependency is unavailable.
+
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Sign in with email and password
+      description: |
+        Rate limited per IP and fails closed when the limiter is unavailable.
+        Five consecutive failures lock the account for 15 minutes.
+
+        Send `X-Auth-Mode: cookie` to receive the refresh token as a HttpOnly
+        cookie instead of in the body (recommended for browsers).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AuthMode'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: sr.alasgarov@gmail.com }
+                password: { type: string, format: password, example: 'Anh0@111118' }
+                tenant_slug:
+                  type: string
+                  description: Required only when the email exists in several tenants.
+                  example: acme
+      responses:
+        '200':
+          description: Signed in.
+          headers:
+            Set-Cookie:
+              description: Present in cookie mode — `wg_refresh_token`, HttpOnly, SameSite=Strict.
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/LoginResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The account is locked, suspended or disabled.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://wallet-gateway/errors/account-locked
+                title: Account locked
+                status: 403
+                detail: Account is locked due to failed login attempts. Try again later or contact an administrator.
+                code: ACCOUNT_LOCKED
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Rotate the refresh token
+      description: |
+        Every refresh rotates the token. Presenting an already-rotated token is
+        treated as theft: the whole token family is revoked and
+        `TOKEN_REUSE_DETECTED` is returned.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AuthMode'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token:
+                  type: string
+                  description: Omit in cookie mode — the cookie is used instead.
+      responses:
+        '200':
+          description: New token pair issued.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/TokenResult' }
+        '401':
+          description: Invalid, expired or reused token.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://wallet-gateway/errors/token-reuse-detected
+                title: Token reuse detected
+                status: 401
+                detail: This refresh token was already used. All sessions in this family were revoked.
+                code: TOKEN_REUSE_DETECTED
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Revoke the current session
+      responses:
+        '204': { description: Signed out. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/logout-all:
+    post:
+      tags: [Authentication]
+      summary: Revoke every session of the current principal
+      responses:
+        '204': { description: All sessions revoked. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/change-password:
+    post:
+      tags: [Authentication]
+      summary: Change the current password
+      description: Revokes all other sessions and clears `must_change_password`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password:
+                  type: string
+                  format: password
+                  description: At least 10 characters with upper, lower, digit and special characters.
+      responses:
+        '204': { description: Password changed. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [Authentication]
+      summary: The current principal and its effective permissions
+      responses:
+        '200':
+          description: Current identity.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user: { $ref: '#/components/schemas/User' }
+                          permissions:
+                            type: array
+                            description: '`service.resource.action[.field]:scope` entries.'
+                            items: { type: string }
+                            example:
+                              - user-management.users.read:tenant
+                              - user-management.users.read.email:tenant
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/sessions:
+    get:
+      tags: [Authentication]
+      summary: List the current principal's active sessions
+      responses:
+        '200':
+          description: Active sessions.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/auth/sessions/{sessionId}:
+    delete:
+      tags: [Authentication]
+      summary: Revoke one of your own sessions
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Session revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/oauth/token:
+    post:
+      tags: [OAuth]
+      summary: OAuth 2.0 client-credentials grant
+      description: |
+        Issues an access token for an API client. Accepts JSON or
+        `application/x-www-form-urlencoded`. The response is the bare RFC 6749
+        shape, not the platform envelope.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClientCredentialsRequest' }
+            example:
+              grant_type: client_credentials
+              client_id: wg_OktfDAisD8acnhGc
+              client_secret: k1nxNRqQ1_example_secret
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/ClientCredentialsRequest' }
+      responses:
+        '200':
+          description: Token issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token: { type: string }
+                  token_type: { type: string, example: Bearer }
+                  expires_in: { type: integer, example: 1799 }
+                  scope: { type: string, example: wallet.read }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Unknown client, wrong secret, revoked/expired client, or IP not allow-listed.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/tenants:
+    post:
+      tags: [Tenants]
+      summary: Create a tenant
+      description: Requires `user-management.tenants.create` (platform only).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug]
+              properties:
+                name: { type: string, example: Acme Payments }
+                slug:
+                  type: string
+                  pattern: '^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$'
+                  example: acme
+      responses:
+        '201':
+          description: Tenant created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Tenants]
+      summary: List tenants
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/SortBy'
+        - $ref: '#/components/parameters/SortDir'
+        - $ref: '#/components/parameters/Search'
+        - name: 'filter[status]'
+          in: query
+          schema: { $ref: '#/components/schemas/TenantStatus' }
+        - name: 'filter[slug]'
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Tenant page.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/tenants/{tenantId}:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    get:
+      tags: [Tenants]
+      summary: Read a tenant
+      responses:
+        '200':
+          description: Tenant.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Tenants]
+      summary: Update a tenant
+      description: Status transitions are platform-only. Pass `version` for optimistic locking.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                status: { $ref: '#/components/schemas/TenantStatus' }
+                version: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated tenant.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Tenant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Tenants]
+      summary: Terminate a tenant (soft delete)
+      responses:
+        '204': { description: Tenant terminated. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/users/search:
+    post:
+      tags: [Users]
+      summary: Dynamic search over users
+      description: |
+        Body carries an AND/OR condition tree. Requires `users.search` **and**
+        `users.search.<field>` for every field referenced in the filter or
+        sort — otherwise `403 FIELD_NOT_ALLOWED` naming the field. Result rows
+        are still read-field filtered, so you can filter by a field you cannot
+        read but never see a field you lack read permission for.
+      parameters:
+        - name: tenant_id
+          in: query
+          description: Platform callers only.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: Matching users (fields filtered by read permissions).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: Missing search permission, or a field without `search.<field>`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/v1/tenants/search:
+    post:
+      tags: [Tenants]
+      summary: Dynamic search over tenants
+      description: Requires `tenants.search` plus `tenants.search.<field>` for every field touched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: Matching tenants.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Tenant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/api-clients/search:
+    post:
+      tags: [API Clients]
+      summary: Dynamic search over API clients
+      description: Requires `api-clients.search` plus `api-clients.search.<field>` for every field touched.
+      parameters:
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchRequest' }
+      responses:
+        '200':
+          description: Matching API clients.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ApiClient' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/users:
+    post:
+      tags: [Users]
+      summary: Create a user
+      description: |
+        Requires `user-management.users.create`. Every protected field in the
+        body additionally requires `users.update.<field>`; unknown fields are
+        rejected (mass-assignment protection). The new user always starts with
+        `must_change_password=true`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                tenant_id:
+                  type: string
+                  format: uuid
+                  description: Platform callers only; omit to create a platform user.
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+                first_name: { type: string }
+                last_name: { type: string }
+                phone: { type: string }
+                role_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  description: Subject to the delegation rule for every permission the roles bundle.
+            example:
+              tenant_id: a28caf1c-fe55-417f-b8e3-6bb3ef9af87a
+              email: admin@acme.test
+              password: 'Acme@Str0ng!1'
+              first_name: Acme
+              last_name: Admin
+              role_ids: [a2000000-0000-4000-8000-000000000002]
+      responses:
+        '201':
+          description: User created (fields filtered by read permissions).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [Users]
+      summary: List users
+      description: |
+        Each `filter[<field>]` requires `users.search` **and**
+        `users.search.<field>`; otherwise the request is rejected with
+        `FIELD_NOT_ALLOWED`.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/SortBy'
+        - $ref: '#/components/parameters/SortDir'
+        - $ref: '#/components/parameters/Search'
+        - name: tenant_id
+          in: query
+          description: Platform callers only.
+          schema: { type: string, format: uuid }
+        - name: 'filter[email]'
+          in: query
+          schema: { type: string }
+        - name: 'filter[first_name]'
+          in: query
+          schema: { type: string }
+        - name: 'filter[last_name]'
+          in: query
+          schema: { type: string }
+        - name: 'filter[phone]'
+          in: query
+          schema: { type: string }
+        - name: 'filter[status]'
+          in: query
+          schema: { $ref: '#/components/schemas/UserStatus' }
+      responses:
+        '200':
+          description: User page.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/User' }
+        '403':
+          description: Missing list permission, or a filter field without `search.<field>`.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://wallet-gateway/errors/field-not-allowed
+                title: Field not allowed
+                status: 403
+                detail: You do not have permission to use field "filter:email".
+                code: FIELD_NOT_ALLOWED
+
+  /api/v1/users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      summary: Read a user
+      description: Fields without a matching `users.read.<field>` grant are omitted from the response.
+      responses:
+        '200':
+          description: User.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Users]
+      summary: Update a user
+      description: Each field requires `users.update.<field>`. Pass `version` for optimistic locking.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                first_name: { type: string }
+                last_name: { type: string }
+                phone: { type: string }
+                internal_notes: { type: string }
+                version: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated user.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Users]
+      summary: Delete a user (soft delete + session revocation)
+      responses:
+        '204': { description: User deleted. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/users/{userId}/activate:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      tags: [Users]
+      summary: Activate a user
+      responses:
+        '204': { description: User activated. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/users/{userId}/suspend:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      tags: [Users]
+      summary: Suspend a user (revokes their sessions)
+      responses:
+        '204': { description: User suspended. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/users/{userId}/unlock:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      tags: [Users]
+      summary: Unlock a locked user
+      responses:
+        '204': { description: User unlocked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/users/{userId}/effective-permissions:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    get:
+      tags: [Permissions]
+      summary: Effective permissions of a user (roles + direct grants)
+      responses:
+        '200':
+          description: Effective permissions.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/users/{userId}/roles:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      tags: [Roles]
+      summary: Assign a role to a user
+      description: |
+        Requires `roles.assign` and passes every permission the role bundles
+        through the delegation rule.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_id]
+              properties:
+                role_id: { type: string, format: uuid }
+      responses:
+        '201': { description: Role assigned. }
+        '403': { $ref: '#/components/responses/DelegationDenied' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/users/{userId}/roles/{roleId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - $ref: '#/components/parameters/RoleId'
+    delete:
+      tags: [Roles]
+      summary: Revoke a role from a user
+      responses:
+        '204': { description: Role revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/users/{userId}/permissions:
+    parameters: [{ $ref: '#/components/parameters/UserId' }]
+    post:
+      tags: [Permissions]
+      summary: Grant a direct permission to a user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrantRequest' }
+      responses:
+        '201':
+          description: Permission granted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/DelegationDenied' }
+
+  /api/v1/users/{userId}/permissions/{permissionId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - name: permissionId
+        in: path
+        required: true
+        description: Id of the grant row (not the catalog definition).
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Permissions]
+      summary: Revoke a direct permission
+      responses:
+        '204': { description: Permission revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/roles:
+    post:
+      tags: [Roles]
+      summary: Create a custom role
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: Support L1 }
+                description: { type: string }
+                tenant_id:
+                  type: string
+                  format: uuid
+                  description: Platform callers only; omit for a platform role.
+      responses:
+        '201':
+          description: Role created.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Roles]
+      summary: List roles (system roles included)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Search'
+        - name: 'filter[role_type]'
+          in: query
+          schema: { type: string, enum: [platform, tenant] }
+        - name: 'filter[status]'
+          in: query
+          schema: { type: string, enum: [active, disabled] }
+      responses:
+        '200':
+          description: Role page.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/roles/{roleId}:
+    parameters: [{ $ref: '#/components/parameters/RoleId' }]
+    get:
+      tags: [Roles]
+      summary: Read a role with its permissions
+      responses:
+        '200':
+          description: Role and grants.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          role: { $ref: '#/components/schemas/Role' }
+                          permissions:
+                            type: array
+                            items: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Roles]
+      summary: Update a custom role
+      description: System roles are immutable and return 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                status: { type: string, enum: [active, disabled] }
+                version: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated role.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Role' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Roles]
+      summary: Delete a custom role
+      description: Fails with 409 while the role is still assigned to users.
+      responses:
+        '204': { description: Role deleted. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/roles/{roleId}/permissions:
+    parameters: [{ $ref: '#/components/parameters/RoleId' }]
+    post:
+      tags: [Roles]
+      summary: Attach a permission to a role
+      description: |
+        Enforces the delegation rule: the actor must hold the permission at an
+        equal or wider scope. Platform-only permissions can never reach tenant
+        roles, and tenant roles can never hold `scope=all`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrantRequest' }
+      responses:
+        '201':
+          description: Permission attached.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/DelegationDenied' }
+
+  /api/v1/roles/{roleId}/permissions/{permissionId}:
+    parameters:
+      - $ref: '#/components/parameters/RoleId'
+      - name: permissionId
+        in: path
+        required: true
+        description: Id of the grant row.
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Roles]
+      summary: Detach a permission from a role
+      responses:
+        '204': { description: Permission detached. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/permissions:
+    get:
+      tags: [Permissions]
+      summary: Permission catalog
+      description: Tenant principals never see platform-only definitions.
+      responses:
+        '200':
+          description: Catalog.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/PermissionDefinition' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/permissions/tree:
+    get:
+      tags: [Permissions]
+      summary: Permission catalog grouped as service → resource → action → field
+      responses:
+        '200':
+          description: Catalog tree (drives the assignment UI).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/PermissionTreeService' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/api-clients:
+    post:
+      tags: [API Clients]
+      summary: Create an API client
+      description: The generated `client_secret` is returned exactly once.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                tenant_id: { type: string, format: uuid }
+                name: { type: string }
+                description: { type: string }
+                allowed_ips:
+                  type: array
+                  items: { type: string }
+                  description: Empty means any source IP.
+                scopes:
+                  type: array
+                  items: { type: string }
+                expires_at: { type: string, format: date-time }
+      responses:
+        '201':
+          description: Client created — store the secret now.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CreatedApiClient' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [API Clients]
+      summary: List API clients
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Search'
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: 'filter[status]'
+          in: query
+          schema: { $ref: '#/components/schemas/ApiClientStatus' }
+      responses:
+        '200':
+          description: API client page.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ApiClient' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/api-clients/{clientId}:
+    parameters: [{ $ref: '#/components/parameters/ClientId' }]
+    get:
+      tags: [API Clients]
+      summary: Read an API client with its permissions
+      description: The secret is never returned here — only its hash is stored.
+      responses:
+        '200':
+          description: API client.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          client: { $ref: '#/components/schemas/ApiClient' }
+                          permissions:
+                            type: array
+                            items: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [API Clients]
+      summary: Update an API client
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                allowed_ips:
+                  type: array
+                  items: { type: string }
+                status: { type: string, enum: [active, suspended] }
+                version: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Updated client.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/ApiClient' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [API Clients]
+      summary: Revoke an API client
+      description: Revoked clients can no longer obtain tokens.
+      responses:
+        '204': { description: Client revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/api-clients/{clientId}/rotate-secret:
+    parameters: [{ $ref: '#/components/parameters/ClientId' }]
+    post:
+      tags: [API Clients]
+      summary: Rotate the client secret
+      description: The previous secret stops working immediately. The new one is shown once.
+      responses:
+        '200':
+          description: Secret rotated.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/CreatedApiClient' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/api-clients/{clientId}/permissions:
+    parameters: [{ $ref: '#/components/parameters/ClientId' }]
+    post:
+      tags: [API Clients]
+      summary: Grant a permission to an API client
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GrantRequest' }
+      responses:
+        '201':
+          description: Permission granted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/PermissionGrant' }
+        '403': { $ref: '#/components/responses/DelegationDenied' }
+
+  /api/v1/api-clients/{clientId}/permissions/{permissionId}:
+    parameters:
+      - $ref: '#/components/parameters/ClientId'
+      - name: permissionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [API Clients]
+      summary: Revoke an API client permission
+      responses:
+        '204': { description: Permission revoked. }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/audit-logs:
+    get:
+      tags: [Audit Logs]
+      summary: List audit entries
+      description: Append-only. Passwords, tokens and secrets are never recorded.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: 'filter[action]'
+          in: query
+          schema: { type: string, example: user.created }
+        - name: 'filter[resource]'
+          in: query
+          schema: { type: string, example: users }
+        - name: 'filter[actor_id]'
+          in: query
+          schema: { type: string, format: uuid }
+        - name: 'filter[result]'
+          in: query
+          schema: { type: string, enum: [success, failure, denied] }
+      responses:
+        '200':
+          description: Audit page (newest first).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/AuditLog' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/audit-logs/{auditLogId}:
+    parameters:
+      - name: auditLogId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Audit Logs]
+      summary: Read one audit entry
+      responses:
+        '200':
+          description: Audit entry.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Envelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/AuditLog' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access token from `/auth/login`, `/auth/refresh` or `/oauth/token`.
+        Claims: `sub`, `principal_type`, `tenant_id`, `session_id`, `client_id`,
+        `jti`, `iss`, `aud`, `iat`, `nbf`, `exp`. Permissions are NOT in the
+        token; they are resolved per request.
+
+  parameters:
+    AuthMode:
+      name: X-Auth-Mode
+      in: header
+      required: false
+      description: Set to `cookie` to receive the refresh token as a HttpOnly cookie.
+      schema: { type: string, enum: [cookie] }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Repeat-safe writes. The same key replays the stored response; the same
+        key with a different body returns 409 `IDEMPOTENCY_CONFLICT`.
+      schema: { type: string }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    PageSize:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    SortBy:
+      name: sort_by
+      in: query
+      description: Allow-listed per resource; unknown values fall back to `created_at`.
+      schema: { type: string }
+    SortDir:
+      name: sort_dir
+      in: query
+      schema: { type: string, enum: [asc, desc], default: desc }
+    Search:
+      name: search
+      in: query
+      description: Free-text search; requires the resource's `search` permission.
+      schema: { type: string }
+    TenantId:
+      name: tenantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    UserId:
+      name: userId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RoleId:
+      name: roleId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ClientId:
+      name: clientId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing, invalid or expired credentials.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: Authenticated but not permitted.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://wallet-gateway/errors/permission-denied
+            title: Permission denied
+            status: 403
+            detail: You do not have permission to create users.
+            code: PERMISSION_DENIED
+            request_id: 7952325a-7dd7-4c66-9ca0-6138d5df1ceb
+    DelegationDenied:
+      description: The actor tried to grant a permission it does not hold, or a wider scope.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://wallet-gateway/errors/permission-delegation-denied
+            title: Permission delegation denied
+            status: 403
+            detail: 'cannot delegate user-management.users.read: requested scope "tenant" is wider than your scope "own"'
+            code: PERMISSION_DELEGATION_DENIED
+    NotFound:
+      description: Not found, or hidden by tenant isolation.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: Duplicate, invalid state transition, or optimistic-lock conflict.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationError:
+      description: The request failed validation.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Envelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data: {}
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    SearchRequest:
+      type: object
+      description: |
+        A dynamic search. `filter` is a tree: a **group** node has `op`
+        (`and`/`or`) and `conditions`; a **leaf** node has `field`, `op`
+        (a comparison) and `value`.
+      properties:
+        filter: { $ref: '#/components/schemas/FilterNode' }
+        sort:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              dir: { type: string, enum: [asc, desc], default: asc }
+        page: { type: integer, minimum: 1, default: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      example:
+        filter:
+          op: and
+          conditions:
+            - { field: first_name, op: eq, value: Elam }
+            - op: or
+              conditions:
+                - { field: last_name, op: ilike, value: "swn%" }
+                - { field: status, op: in, value: [active, pending] }
+        sort:
+          - { field: created_at, dir: desc }
+        page: 1
+        page_size: 20
+
+    FilterNode:
+      type: object
+      description: |
+        Group node (`op` + `conditions`) or leaf node (`field` + `op` +
+        `value`). Comparison operators: `eq`, `neq`, `like`, `ilike`, `in`,
+        `gt`, `gte`, `lt`, `lte` — allowed set depends on the field type.
+      properties:
+        op:
+          type: string
+          description: '`and`/`or` for a group; a comparison operator for a leaf.'
+        conditions:
+          type: array
+          items: { $ref: '#/components/schemas/FilterNode' }
+        field: { type: string }
+        value:
+          description: Scalar for most operators; an array for `in`.
+
+    ListEnvelope:
+      type: object
+      required: [data, pagination, meta]
+      properties:
+        data:
+          type: array
+          items: {}
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        meta: { $ref: '#/components/schemas/Meta' }
+
+    Meta:
+      type: object
+      properties:
+        request_id: { type: string }
+        timestamp: { type: string, format: date-time }
+
+    Pagination:
+      type: object
+      properties:
+        page: { type: integer, example: 1 }
+        page_size: { type: integer, example: 20 }
+        total: { type: integer, example: 100 }
+        total_pages: { type: integer, example: 5 }
+
+    Problem:
+      type: object
+      description: RFC 7807 problem document.
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri, example: https://wallet-gateway/errors/permission-denied }
+        title: { type: string, example: Permission denied }
+        status: { type: integer, example: 403 }
+        detail: { type: string, example: You do not have permission to assign this permission. }
+        code:
+          type: string
+          description: Stable machine-readable code.
+          enum:
+            - VALIDATION_ERROR
+            - UNAUTHORIZED
+            - INVALID_CREDENTIALS
+            - TOKEN_EXPIRED
+            - TOKEN_REUSE_DETECTED
+            - ACCOUNT_LOCKED
+            - PASSWORD_CHANGE_REQUIRED
+            - PERMISSION_DENIED
+            - PERMISSION_DELEGATION_DENIED
+            - TENANT_MISMATCH
+            - NOT_FOUND
+            - CONFLICT
+            - VERSION_CONFLICT
+            - IDEMPOTENCY_CONFLICT
+            - RATE_LIMITED
+            - FIELD_NOT_ALLOWED
+            - INTERNAL_ERROR
+            - SERVICE_UNAVAILABLE
+        request_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }
+
+    LoginResult:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token:
+          type: string
+          description: Omitted in cookie mode.
+        token_type: { type: string, example: Bearer }
+        expires_at: { type: string, format: date-time }
+        must_change_password: { type: boolean }
+        user: { $ref: '#/components/schemas/User' }
+
+    TokenResult:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string, description: Omitted in cookie mode. }
+        token_type: { type: string, example: Bearer }
+        expires_at: { type: string, format: date-time }
+        must_change_password: { type: boolean }
+
+    ClientCredentialsRequest:
+      type: object
+      required: [grant_type, client_id, client_secret]
+      properties:
+        grant_type: { type: string, enum: [client_credentials] }
+        client_id: { type: string }
+        client_secret: { type: string, format: password }
+
+    UserStatus:
+      type: string
+      enum: [pending, active, suspended, locked, disabled]
+
+    TenantStatus:
+      type: string
+      enum: [pending, active, suspended, terminated]
+
+    ApiClientStatus:
+      type: string
+      enum: [active, suspended, expired, revoked]
+
+    Scope:
+      type: string
+      description: Permission reach, from narrowest to widest.
+      enum: [own, assigned, team, organization, descendants, tenant, all]
+
+    Effect:
+      type: string
+      description: '`deny` always overrides `allow`.'
+      enum: [allow, deny]
+
+    User:
+      type: object
+      description: |
+        Protected fields are ABSENT unless the caller holds the matching
+        `users.read.<field>` permission. Secret material (password hash,
+        refresh token hash) is never present.
+      required: [id, user_type, must_change_password, created_at, updated_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, description: Empty for platform users. }
+        user_type: { type: string, enum: [platform_user, tenant_user, service_account] }
+        must_change_password: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        version: { type: integer, format: int64 }
+        email: { type: string, format: email, description: 'Requires users.read.email.' }
+        first_name: { type: string, description: 'Requires users.read.first_name.' }
+        last_name: { type: string, description: 'Requires users.read.last_name.' }
+        phone: { type: string, description: 'Requires users.read.phone.' }
+        status:
+          allOf: [{ $ref: '#/components/schemas/UserStatus' }]
+          description: 'Requires users.read.status.'
+        internal_notes: { type: string, description: 'Requires users.read.internal_notes.' }
+        security_flags:
+          type: object
+          additionalProperties: true
+          description: 'Requires users.read.security_flags (platform only).'
+      example:
+        id: bea0a88e-6d3c-4f4e-aa88-fd216375ff62
+        tenant_id: a28caf1c-fe55-417f-b8e3-6bb3ef9af87a
+        user_type: tenant_user
+        must_change_password: true
+        email: admin@acme.test
+        first_name: Acme
+        last_name: Admin
+        status: active
+        created_at: '2026-07-16T04:44:47.022249Z'
+        updated_at: '2026-07-16T04:44:47.022249Z'
+        version: 1
+
+    Tenant:
+      type: object
+      required: [id, name, slug, status, created_at, updated_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        status: { $ref: '#/components/schemas/TenantStatus' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        version: { type: integer, format: int64 }
+
+    Role:
+      type: object
+      required: [id, name, description, role_type, is_system, status, created_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, description: Empty for system/platform roles. }
+        name: { type: string }
+        description: { type: string }
+        role_type: { type: string, enum: [platform, tenant] }
+        is_system: { type: boolean, description: System roles are immutable. }
+        status: { type: string, enum: [active, disabled] }
+        created_at: { type: string, format: date-time }
+        version: { type: integer, format: int64 }
+
+    PermissionDefinition:
+      type: object
+      description: An entry of the permission catalog.
+      required: [id, code, service, resource, action, description, is_platform_only]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, example: user-management.users.read.email }
+        service: { type: string, example: user-management }
+        resource: { type: string, example: users }
+        action:
+          type: string
+          enum: [create, read, update, delete, search, list, assign, revoke, export, rotate]
+        field: { type: string, description: Present for field-level entries. }
+        description: { type: string }
+        is_platform_only: { type: boolean }
+
+    PermissionGrant:
+      type: object
+      description: A permission attached to a role, user or API client.
+      required: [code, scope, effect]
+      properties:
+        id: { type: string, format: uuid, description: Grant row id; empty for role-derived entries. }
+        permission_id: { type: string, format: uuid }
+        code: { type: string, example: user-management.users.read.email }
+        service: { type: string }
+        resource: { type: string }
+        action: { type: string }
+        field: { type: string }
+        scope: { $ref: '#/components/schemas/Scope' }
+        effect: { $ref: '#/components/schemas/Effect' }
+        conditions:
+          type: object
+          additionalProperties: { type: string }
+
+    GrantRequest:
+      type: object
+      required: [permission_id]
+      properties:
+        permission_id: { type: string, format: uuid }
+        scope: { $ref: '#/components/schemas/Scope' }
+        effect: { $ref: '#/components/schemas/Effect' }
+        conditions:
+          type: object
+          additionalProperties: { type: string }
+      example:
+        permission_id: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+        scope: tenant
+        effect: allow
+
+    PermissionTreeAction:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        action: { type: string }
+        code: { type: string }
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/PermissionDefinition' }
+
+    PermissionTreeResource:
+      type: object
+      properties:
+        resource: { type: string }
+        actions:
+          type: array
+          items: { $ref: '#/components/schemas/PermissionTreeAction' }
+
+    PermissionTreeService:
+      type: object
+      properties:
+        service: { type: string }
+        resources:
+          type: array
+          items: { $ref: '#/components/schemas/PermissionTreeResource' }
+
+    ApiClient:
+      type: object
+      required: [id, tenant_id, name, client_id, allowed_ips, scopes, status, created_at, version]
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        client_id: { type: string, example: wg_OktfDAisD8acnhGc }
+        allowed_ips:
+          type: array
+          items: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        status: { $ref: '#/components/schemas/ApiClientStatus' }
+        expires_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+        secret_rotated_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        version: { type: integer, format: int64 }
+
+    CreatedApiClient:
+      type: object
+      properties:
+        client: { $ref: '#/components/schemas/ApiClient' }
+        client_secret:
+          type: string
+          description: Shown exactly once; stored only as an Argon2id hash.
+        warning: { type: string, example: Store this secret now. It cannot be retrieved again. }
+
+    Session:
+      type: object
+      required: [id, created_at, last_used_at, expires_at, current]
+      properties:
+        id: { type: string, format: uuid }
+        ip: { type: string }
+        user_agent: { type: string }
+        created_at: { type: string, format: date-time }
+        last_used_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        current: { type: boolean, description: True for the session making this request. }
+
+    AuditLog:
+      type: object
+      description: Immutable security record. Never contains secrets.
+      required: [id, occurred_at, actor_type, action, resource, result]
+      properties:
+        id: { type: string, format: uuid }
+        occurred_at: { type: string, format: date-time }
+        actor_id: { type: string }
+        actor_type:
+          type: string
+          enum: [platform_user, tenant_user, api_client, service_account, system]
+        tenant_id: { type: string }
+        action: { type: string, example: user.created }
+        resource: { type: string, example: users }
+        resource_id: { type: string }
+        before_state:
+          type: object
+          additionalProperties: true
+        after_state:
+          type: object
+          additionalProperties: true
+        changed_fields:
+          type: array
+          items: { type: string }
+        ip: { type: string }
+        user_agent: { type: string }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        result: { type: string, enum: [success, failure, denied] }
+        denial_reason: { type: string, example: permission_missing }

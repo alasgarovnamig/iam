@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OPA Viewer — Wallet Gateway</title>
+<style>
+  :root {
+    --bg: #0f1720; --panel: #16212e; --panel2: #1d2a3a; --line: #263445;
+    --text: #e6edf3; --muted: #8aa0b6; --accent: #5fa8d3; --accent2: #1b4965;
+    --green: #3fb950; --red: #f85149; --amber: #d29922;
+    --key: #7ee787; --str: #a5d6ff; --num: #79c0ff; --bool: #ff7b72;
+    --kw: #ff7b72; --rule: #d2a8ff; --com: #6e7d8c;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 14px 20px;
+    background: linear-gradient(90deg, var(--accent2), #0f1720);
+    border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .dot.bad { background: var(--red); box-shadow: 0 0 8px var(--red); }
+  nav { display: flex; gap: 4px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  nav button {
+    background: none; border: none; color: var(--muted); padding: 12px 16px;
+    cursor: pointer; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  nav .count { color: var(--muted); font-size: 11px; margin-left: 5px; background: var(--panel2); padding: 1px 7px; border-radius: 10px; }
+  main { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  .toolbar input[type=text] {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; min-width: 240px;
+  }
+  button.btn {
+    background: var(--accent2); color: #fff; border: 1px solid var(--line);
+    padding: 8px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 500;
+  }
+  button.btn:hover { background: var(--accent); }
+  button.ghost { background: var(--panel2); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 14px; overflow: hidden; }
+  .card > .head {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: var(--panel2); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 13px;
+  }
+  .card > .head .tag { color: var(--muted); font-size: 11px; margin-left: auto; }
+  pre { margin: 0; padding: 14px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px; line-height: 1.6; }
+  .muted { color: var(--muted); }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+  textarea {
+    width: 100%; min-height: 300px; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 14px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.6; resize: vertical;
+  }
+  .label { font-size: 12px; color: var(--muted); margin: 0 0 6px; text-transform: uppercase; letter-spacing: .5px; }
+  .verdict { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 10px; margin-bottom: 12px; font-weight: 600; }
+  .verdict.allow { background: rgba(63,185,80,.12); border: 1px solid var(--green); color: var(--green); }
+  .verdict.deny  { background: rgba(248,81,73,.12); border: 1px solid var(--red); color: var(--red); }
+  .verdict.err   { background: rgba(210,153,34,.12); border: 1px solid var(--amber); color: var(--amber); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .chip { font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 6px; background: var(--panel2); border: 1px solid var(--line); }
+  .chip.ok { border-color: var(--green); color: var(--key); }
+  .chip.no { border-color: var(--red); color: var(--bool); }
+  .empty { text-align: center; color: var(--muted); padding: 40px; }
+  .samples { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .samples button { font-size: 12px; }
+  /* JSON syntax colours */
+  .j-key { color: var(--key); } .j-str { color: var(--str); } .j-num { color: var(--num); }
+  .j-bool { color: var(--bool); } .j-null { color: var(--muted); }
+  /* Rego syntax colours */
+  .r-kw { color: var(--kw); } .r-com { color: var(--com); font-style: italic; }
+  .r-str { color: var(--str); } .r-rule { color: var(--rule); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>OPA Viewer</h1>
+    <div class="sub">Wallet Gateway · policies &amp; data loaded into Open Policy Agent</div>
+  </div>
+  <div class="status">
+    <span class="dot" id="dot"></span><span id="statusText">connecting…</span>
+  </div>
+</header>
+
+<nav>
+  <button data-tab="policies" class="active">Policies <span class="count" id="polCount">–</span></button>
+  <button data-tab="data">Data</button>
+  <button data-tab="test">Test a decision</button>
+</nav>
+
+<main>
+  <!-- POLICIES -->
+  <section class="tab active" id="tab-policies">
+    <div class="toolbar">
+      <input type="text" id="polFilter" placeholder="Filter policies by name…" />
+      <button class="btn ghost" onclick="loadPolicies()">Refresh</button>
+    </div>
+    <div id="policies"><div class="empty">Loading policies…</div></div>
+  </section>
+
+  <!-- DATA -->
+  <section class="tab" id="tab-data">
+    <div class="toolbar">
+      <input type="text" id="dataPath" placeholder="data path, e.g. wallet/authz" />
+      <button class="btn" onclick="loadData()">Fetch</button>
+      <span class="muted">Shows the document tree OPA exposes at <code>/v1/data/&lt;path&gt;</code>.</span>
+    </div>
+    <div class="card">
+      <div class="head"><span id="dataHead">data</span></div>
+      <pre id="data"><span class="muted">Loading…</span></pre>
+    </div>
+  </section>
+
+  <!-- TEST -->
+  <section class="tab" id="tab-test">
+    <div class="toolbar">
+      <input type="text" id="rulePath" value="wallet/authz/decision" />
+      <button class="btn" onclick="evaluate()">Evaluate ▶</button>
+      <span class="muted">POST input to <code>/v1/data/&lt;rule path&gt;</code></span>
+    </div>
+    <div class="samples" id="samples"></div>
+    <div class="split">
+      <div>
+        <p class="label">Input (JSON)</p>
+        <textarea id="input" spellcheck="false"></textarea>
+      </div>
+      <div>
+        <p class="label">Result</p>
+        <div id="result"><div class="empty">Press “Evaluate” to see the decision.</div></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const OPA = "/opa"; // nginx reverse-proxies this to the opa service
+
+// ---------- helpers ----------
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function highlightJSON(obj){
+  const json = JSON.stringify(obj, null, 2);
+  return esc(json).replace(
+    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)/g,
+    (m) => {
+      let cls = 'j-num';
+      if (/^"/.test(m)) cls = /:$/.test(m) ? 'j-key' : 'j-str';
+      else if (/true|false/.test(m)) cls = 'j-bool';
+      else if (/null/.test(m)) cls = 'j-null';
+      return `<span class="${cls}">${m}</span>`;
+    }
+  );
+}
+
+// Light Rego highlighter: comments, strings, keywords, rule heads.
+function highlightRego(src){
+  const KW = ['package','import','default','not','some','every','in','if','else','with','as','contains'];
+  const lines = esc(src).split('\n').map(line => {
+    // comment
+    const c = line.indexOf('#');
+    let code = line, comment = '';
+    if (c >= 0){ code = line.slice(0,c); comment = `<span class="r-com">${line.slice(c)}</span>`; }
+    // strings
+    code = code.replace(/&quot;[^&]*?&quot;|"[^"]*"/g, s => `<span class="r-str">${s}</span>`);
+    // keywords
+    code = code.replace(new RegExp('\\b('+KW.join('|')+')\\b','g'), k => `<span class="r-kw">${k}</span>`);
+    // rule head (word before := or { or [ at start of line)
+    code = code.replace(/^(\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*(?::=|:=|\[|\{|\s+contains|\s+if|\s+:=))/,
+      (m,ws,name,rest)=>`${ws}<span class="r-rule">${name}</span>${rest}`);
+    return code + comment;
+  });
+  return lines.join('\n');
+}
+
+async function opa(path, opts){
+  const res = await fetch(OPA + path, opts);
+  const text = await res.text();
+  let body; try { body = JSON.parse(text); } catch { body = text; }
+  if (!res.ok) throw new Error(typeof body === 'string' ? body : (body.message || res.statusText));
+  return body;
+}
+
+// ---------- connection status ----------
+async function ping(){
+  const dot = document.getElementById('dot'), t = document.getElementById('statusText');
+  try {
+    await opa('/health');
+    dot.className = 'dot ok'; t.textContent = 'OPA connected';
+  } catch(e){
+    dot.className = 'dot bad'; t.textContent = 'OPA unreachable';
+  }
+}
+
+// ---------- policies ----------
+let allPolicies = [];
+async function loadPolicies(){
+  const box = document.getElementById('policies');
+  try {
+    const r = await opa('/v1/policies');
+    allPolicies = r.result || [];
+    document.getElementById('polCount').textContent = allPolicies.length;
+    renderPolicies();
+  } catch(e){
+    box.innerHTML = `<div class="empty">Could not load policies: ${esc(e.message)}</div>`;
+  }
+}
+function renderPolicies(){
+  const f = document.getElementById('polFilter').value.toLowerCase();
+  const box = document.getElementById('policies');
+  const list = allPolicies.filter(p => p.id.toLowerCase().includes(f));
+  if (!list.length){ box.innerHTML = '<div class="empty">No policies match.</div>'; return; }
+  box.innerHTML = list.map(p => {
+    const pkg = (p.raw.match(/package\s+([^\s]+)/) || [,'—'])[1];
+    const lines = p.raw.split('\n').length;
+    return `<div class="card">
+      <div class="head">📄 ${esc(p.id)} <span class="tag">package ${esc(pkg)} · ${lines} lines</span></div>
+      <pre>${highlightRego(p.raw)}</pre>
+    </div>`;
+  }).join('');
+}
+
+// ---------- data ----------
+async function loadData(){
+  const path = document.getElementById('dataPath').value.trim().replace(/^\/+|\/+$/g,'');
+  const pre = document.getElementById('data');
+  document.getElementById('dataHead').textContent = 'data' + (path ? '/'+path : '');
+  pre.innerHTML = '<span class="muted">Loading…</span>';
+  try {
+    const r = await opa('/v1/data' + (path ? '/'+path : ''));
+    pre.innerHTML = ('result' in r) ? highlightJSON(r.result) : '<span class="muted">(no data at this path)</span>';
+  } catch(e){
+    pre.innerHTML = `<span class="muted">Error: ${esc(e.message)}</span>`;
+  }
+}
+
+// ---------- test a decision ----------
+const SAMPLES = {
+  "Tenant user · create (ALLOW)": {
+    principal:{id:"user-1",type:"tenant_user",tenant_id:"11111111-1111-4111-8111-111111111111"},
+    request:{method:"POST",path:"/api/v1/users",action:"create",resource:"users"},
+    target:{tenant_id:"11111111-1111-4111-8111-111111111111",resource_id:null},
+    permissions:[{code:"user-management.users.create",scope:"tenant",effect:"allow"}],
+    relationships:{is_self:false,same_tenant:true,platform:false,member:true},
+    context:{ip:"127.0.0.1",time:"2026-01-01T00:00:00Z"}
+  },
+  "Cross-tenant read (DENY)": {
+    principal:{id:"user-1",type:"tenant_user",tenant_id:"11111111-1111-4111-8111-111111111111"},
+    request:{method:"GET",path:"/api/v1/users/x",action:"read",resource:"users"},
+    target:{tenant_id:"22222222-2222-4222-8222-222222222222",resource_id:"x"},
+    permissions:[{code:"user-management.users.read",scope:"tenant",effect:"allow"}],
+    relationships:{is_self:false,same_tenant:false,platform:false,member:true},
+    context:{}
+  },
+  "Field-level read (allowed_fields)": {
+    principal:{id:"user-1",type:"tenant_user",tenant_id:"11111111-1111-4111-8111-111111111111"},
+    request:{method:"GET",path:"/api/v1/users/x",action:"read",resource:"users"},
+    target:{tenant_id:"11111111-1111-4111-8111-111111111111",resource_id:"x"},
+    permissions:[
+      {code:"user-management.users.read",scope:"tenant",effect:"allow"},
+      {code:"user-management.users.read.email",scope:"tenant",effect:"allow"},
+      {code:"user-management.users.read.first_name",scope:"tenant",effect:"allow"}
+    ],
+    relationships:{is_self:false,same_tenant:true,platform:false,member:true},
+    context:{}
+  },
+  "Deny beats allow": {
+    principal:{id:"user-1",type:"tenant_user",tenant_id:"11111111-1111-4111-8111-111111111111"},
+    request:{method:"DELETE",path:"/api/v1/users/x",action:"delete",resource:"users"},
+    target:{tenant_id:"11111111-1111-4111-8111-111111111111",resource_id:"x"},
+    permissions:[
+      {code:"user-management.users.delete",scope:"tenant",effect:"allow"},
+      {code:"user-management.users.delete",scope:"tenant",effect:"deny"}
+    ],
+    relationships:{is_self:false,same_tenant:true,platform:false,member:true},
+    context:{}
+  }
+};
+function renderSamples(){
+  document.getElementById('samples').innerHTML =
+    Object.keys(SAMPLES).map(name =>
+      `<button class="btn ghost" onclick='setSample(${JSON.stringify(name)})'>${esc(name)}</button>`
+    ).join('');
+}
+function setSample(name){
+  document.getElementById('input').value = JSON.stringify(SAMPLES[name], null, 2);
+}
+async function evaluate(){
+  const box = document.getElementById('result');
+  const path = document.getElementById('rulePath').value.trim().replace(/^\/+|\/+$/g,'');
+  let input;
+  try { input = JSON.parse(document.getElementById('input').value); }
+  catch(e){ box.innerHTML = `<div class="verdict err">⚠ Input is not valid JSON: ${esc(e.message)}</div>`; return; }
+  box.innerHTML = '<div class="empty">Evaluating…</div>';
+  try {
+    const r = await opa('/v1/data/' + path, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({input})
+    });
+    const d = r.result;
+    if (d === undefined){ box.innerHTML = '<div class="verdict err">No result — is the rule path correct?</div>'; return; }
+    let head = '';
+    if (d && typeof d === 'object' && 'allow' in d){
+      const allow = d.allow === true;
+      head = `<div class="verdict ${allow?'allow':'deny'}">${allow?'✔ ALLOW':'✘ DENY'} <span style="font-weight:400;color:var(--muted)">reason: ${esc(d.reason||'—')}</span></div>`;
+      if (Array.isArray(d.allowed_fields) || Array.isArray(d.denied_fields)){
+        const chips = (arr,cls)=> (arr||[]).map(f=>`<span class="chip ${cls}">${esc(f)}</span>`).join('');
+        head += `<div style="margin-bottom:10px">
+          <div class="label" style="margin-top:6px">allowed fields</div><div class="chips">${chips(d.allowed_fields,'ok')||'<span class="muted">none</span>'}</div>
+          <div class="label" style="margin-top:8px">denied fields</div><div class="chips">${chips(d.denied_fields,'no')||'<span class="muted">none</span>'}</div>
+        </div>`;
+      }
+    }
+    box.innerHTML = head + `<div class="card"><div class="head">raw result</div><pre>${highlightJSON(d)}</pre></div>`;
+  } catch(e){
+    box.innerHTML = `<div class="verdict err">⚠ ${esc(e.message)}</div>`;
+  }
+}
+
+// ---------- wiring ----------
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');
+  document.getElementById('tab-'+b.dataset.tab).classList.add('active');
+});
+document.getElementById('polFilter').oninput = renderPolicies;
+document.getElementById('dataPath').value = 'wallet/authz';
+
+renderSamples();
+setSample(Object.keys(SAMPLES)[0]);
+ping(); setInterval(ping, 10000);
+loadPolicies();
+loadData();
+</script>
+</body>
+</html>

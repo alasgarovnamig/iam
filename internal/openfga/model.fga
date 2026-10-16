@@ -1,0 +1,67 @@
+# Wallet Gateway relationship model (OpenFGA DSL).
+#
+# This file is the single source of truth: the service embeds it and applies
+# it to OpenFGA at start-up (see bootstrap.go).
+#
+# OpenFGA owns the relationship/ownership graph only — never the permission
+# catalog. Permission semantics (action/field/scope/effect) live in
+# PostgreSQL and are evaluated by OPA + the domain engine.
+
+model
+  schema 1.1
+
+type user
+
+type platform
+  relations
+    # Platform staff membership and elevated platform relations.
+    define member: [user]
+    define super_admin: [user]
+    define admin: [user] or super_admin
+    # Anyone who can administer tenants platform-wide.
+    define tenant_manager: admin
+
+type tenant
+  relations
+    # The platform that owns this tenant.
+    define platform: [platform]
+    # Direct tenant membership (users and machine clients).
+    define member: [user, api_client]
+    define owner: [user]
+    define admin: [user] or owner
+    # Platform admins manage every tenant.
+    define manager: admin or tenant_manager from platform
+    # Anyone allowed to see the tenant at all.
+    define viewer: member or manager
+
+type organization_unit
+  relations
+    define tenant: [tenant]
+    define parent: [organization_unit]
+    define member: [user]
+    define manager: [user] or admin from tenant
+
+type role
+  relations
+    # Owning scope: tenant roles belong to a tenant, system roles to platform.
+    define tenant: [tenant]
+    define platform: [platform]
+    # Principals holding this role.
+    define assignee: [user, api_client]
+    # Who may modify the role (system roles have no tenant, so only platform).
+    define manager: admin from tenant or admin from platform
+
+type api_client
+  relations
+    define tenant: [tenant]
+    define manager: admin from tenant
+    define viewer: manager or member from tenant
+
+# Generic resource type for future services (wallets, transactions, payments):
+# they attach to a tenant and reuse the same manager/viewer shape.
+type resource
+  relations
+    define tenant: [tenant]
+    define owner: [user, api_client]
+    define manager: owner or admin from tenant
+    define viewer: manager or member from tenant

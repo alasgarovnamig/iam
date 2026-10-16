@@ -1,0 +1,25 @@
+# Environment — never commit real credentials
+!.env
+.env.local
+*.env
+!.env.example
+
+# Go
+bin/
+*.test
+coverage.out
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Playwright
+playwright-report/
+test-results/
+e2e/.auth/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
